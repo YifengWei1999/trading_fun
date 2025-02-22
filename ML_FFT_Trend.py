@@ -178,7 +178,7 @@ def render_dashboard(prices, dates, levels, types):
         ax_price.plot(segment.index, segment, color=color, lw=2)
     ax_price.scatter(dates, levels, c=np.where(types == 1, 'lime', 'red'),
                      s=80, edgecolors='black', zorder=5)
-    ax_price.set_title('Adaptive Trend Analysis', fontsize=14)
+    ax_price.set_title('10y UST Yield Adaptive Trend Analysis', fontsize=14)
 
     # ===== FFT Spectrum =====
     ax_fft = fig.add_subplot(gs[1, 0])
