@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 # ======== Configuration ========
 SYMBOL = '^TNX'  # 10-Year Treasury Yield
-START_DATE = '2023-01-01'  # Extended history for better wavelet analysis
+START_DATE = '2020-01-01'  # Extended history for better wavelet analysis
 END_DATE = datetime.now().strftime('%Y-%m-%d')
 PRICE_COLUMN = 'Close'
 WAVELET_TYPE = 'cmor1.5-1.0'  # Complex Morlet wavelet
@@ -129,11 +129,6 @@ def extract_trends(prices, min_trend_duration=3):
     Enhanced trend extraction using adaptive thresholds and peak detection
     """
 
-    def calculate_adaptive_threshold(data, window=5):
-        """Calculate adaptive threshold based on price volatility"""
-        rolling_std = data.rolling(window=window).std()
-        return rolling_std.mean() * 0.8
-
     def merge_close_points(points, min_distance=2):
         """Merge pivot points that are too close together"""
         if not points:
@@ -147,41 +142,62 @@ def extract_trends(prices, min_trend_duration=3):
                 merged.append(point)
         return merged
 
+    def calculate_adaptive_threshold(data, window=5):
+        """Calculate adaptive threshold with more weight on recent data"""
+        # Calculate rolling standard deviation
+        rolling_std = data.rolling(window=window).std()
+
+        # Calculate exponentially weighted standard deviation (more weight on recent data)
+        exp_weighted_std = data.ewm(span=20).std()
+
+        # Combine both metrics with more weight on recent data
+        recent_threshold = rolling_std.iloc[-60:].mean() * 0.8  # Last 3 months
+        full_threshold = rolling_std.mean() * 0.8
+
+        # Use 70% weight on recent threshold
+        return 0.7 * recent_threshold + 0.3 * full_threshold
+
     def identify_pivot_points(prices, threshold):
         """Identify potential trend pivot points using price movements"""
         highs = []
         lows = []
 
-        # Calculate smoothed prices using Gaussian filter
+        # Calculate smoothed prices with less smoothing for recent data
         smoothed = pd.Series(
             gaussian_filter1d(prices.values, sigma=1),
             index=prices.index
         )
 
-        # Include the last point as a potential pivot if it's a local extreme
+        # Special handling for recent data (last 60 days)
+        recent_threshold = threshold * 0.7  # More sensitive threshold for recent data
+        last_60_days = prices.index[-60:]
+
+        for i in range(2, len(smoothed) - 2):
+            p = smoothed.iloc[i]
+            prev2, prev1 = smoothed.iloc[i - 2], smoothed.iloc[i - 1]
+            next1, next2 = smoothed.iloc[i + 1], smoothed.iloc[i + 2]
+
+            # Use more sensitive threshold for recent data
+            current_threshold = recent_threshold if smoothed.index[i] in last_60_days else threshold
+
+            if prev2 < prev1 < p > next1 > next2 and abs(p - prev2) > current_threshold:
+                highs.append(smoothed.index[i])
+            elif prev2 > prev1 > p < next1 < next2 and abs(p - prev2) > current_threshold:
+                lows.append(smoothed.index[i])
+
+        # Always check the last point
         last_idx = len(smoothed) - 1
-        if last_idx >= 4:  # Ensure we have enough points
+        if last_idx >= 4:
             last_points = smoothed.iloc[-5:]
             if last_points.iloc[-1] == last_points.max():
                 highs.append(smoothed.index[-1])
             elif last_points.iloc[-1] == last_points.min():
                 lows.append(smoothed.index[-1])
 
-        # Identify other pivot points
-        for i in range(2, len(smoothed) - 2):
-            p = smoothed.iloc[i]
-            prev2, prev1 = smoothed.iloc[i - 2], smoothed.iloc[i - 1]
-            next1, next2 = smoothed.iloc[i + 1], smoothed.iloc[i + 2]
-
-            if prev2 < prev1 < p > next1 > next2 and abs(p - prev2) > threshold * 0.5:
-                highs.append(smoothed.index[i])
-            elif prev2 > prev1 > p < next1 < next2 and abs(p - prev2) > threshold * 0.5:
-                lows.append(smoothed.index[i])
-
         return highs, lows
 
     def validate_trend(trend, prices):
-        """Validate trend data and calculate additional metrics"""
+        """Validate trend data with special handling for recent trends"""
         start_date = trend['start']
         end_date = trend['end']
         segment = prices.loc[start_date:end_date]
@@ -192,14 +208,19 @@ def extract_trends(prices, min_trend_duration=3):
         price_change = end_price - start_price
         direction = 1 if price_change > 0 else -1
 
-        # Calculate trend strength using linear regression
+        # Calculate trend strength
         x = np.arange(len(segment))
         y = segment.values
         slope, _, r_value, _, _ = stats.linregress(x, y)
         strength = abs(r_value)
 
+        # More lenient validation for recent trends (last 60 days)
+        is_recent = (end_date >= prices.index[-60])
+        min_strength = 0.3 if is_recent else 0.4
+        min_price_change = prices.std() * (0.08 if is_recent else 0.1)
+
         # Validate the trend
-        if abs(price_change) < prices.std() * 0.1:  # Filter out very small changes
+        if abs(price_change) < min_price_change or strength < min_strength:
             return None
 
         return {
@@ -211,7 +232,8 @@ def extract_trends(prices, min_trend_duration=3):
             'strength': strength,
             'slope': slope,
             'start_price': start_price,
-            'end_price': end_price
+            'end_price': end_price,
+            'is_recent': is_recent
         }
 
     # Main trend extraction process
@@ -466,6 +488,80 @@ def plot_trend_probabilities(continuation_probs, expected_magnitude, magnitude_u
     plt.tight_layout()
 
 
+def plot_trend_magnitude_duration_heatmap(trace, current_trend, max_duration=30, magnitude_steps=10):
+    """Plot heatmap of trend probabilities with magnitude vs duration"""
+    # Create grid of durations and magnitudes
+    durations = np.arange(1, max_duration + 1)
+
+    # Calculate magnitude range based on historical data
+    base_magnitude = current_trend['magnitude']
+    magnitude_range = np.linspace(base_magnitude * 0.5, base_magnitude * 2, magnitude_steps)
+    probabilities = np.zeros((len(magnitude_range), len(durations)))
+
+    # Extract posterior distributions
+    if current_trend['direction'] == 1:
+        duration_samples = trace.posterior['up_duration_mu'].values.flatten()
+    else:
+        duration_samples = trace.posterior['down_duration_mu'].values.flatten()
+
+    magnitude_mu = np.mean(trace.posterior['magnitude_mu'].values.flatten())
+    magnitude_sigma = np.mean(trace.posterior['magnitude_sigma'].values.flatten())
+
+    duration_mu = np.mean(duration_samples)
+    duration_sigma = np.std(duration_samples)
+
+    # Calculate joint probabilities for each combination
+    for i, mag in enumerate(magnitude_range):
+        for j, dur in enumerate(durations):
+            # Combine duration and magnitude probabilities
+            dur_z_score = (dur - duration_mu) / (duration_sigma + 1e-6)
+            mag_z_score = (mag - magnitude_mu) / (magnitude_sigma + 1e-6)
+
+            # Joint probability (assuming independence)
+            dur_prob = 1 - stats.norm.cdf(dur_z_score)
+            mag_prob = stats.norm.pdf(mag_z_score) / stats.norm.pdf(0)  # Normalize to peak at 1
+
+            probabilities[i, j] = max(0.1, min(0.9, dur_prob * mag_prob))
+
+    # Create heatmap
+    plt.figure(figsize=(12, 8))
+
+    # Plot heatmap
+    im = plt.imshow(probabilities,
+                    aspect='auto',
+                    origin='lower',
+                    extent=[0, max_duration, magnitude_range[0], magnitude_range[-1]],
+                    cmap='RdYlBu_r')
+
+    # Add colorbar
+    plt.colorbar(im, label='Joint Probability')
+
+    # Mark current trend
+    plt.axvline(x=current_trend['duration'],
+                color='black',
+                linestyle='--',
+                alpha=0.5,
+                label=f'Current Duration ({current_trend["duration"]} days)')
+    plt.axhline(y=current_trend['magnitude'],
+                color='black',
+                linestyle=':',
+                alpha=0.5,
+                label=f'Current Magnitude ({current_trend["magnitude"]:.4f})')
+
+    # Customize plot
+    plt.title(
+        f'Trend Duration-Magnitude Probability Heatmap\n{"Uptrend" if current_trend["direction"] == 1 else "Downtrend"}',
+        pad=20)
+    plt.xlabel('Duration (days)')
+    plt.ylabel('Magnitude')
+    plt.legend()
+
+    # Add grid
+    plt.grid(False)
+
+    plt.tight_layout()
+
+
 # ======== Main Execution ========
 def main():
     # Fetch data
@@ -532,7 +628,9 @@ def main():
     print("\n🎨 Generating visualizations...")
     plot_trends_on_price(prices, trends)
     plot_wavelet_analysis(coefficients, periods, prices)
+    plot_bayesian_results(trace, trends, current_trend, continuation_probs)
     plot_trend_probabilities(continuation_probs, expected_magnitude, magnitude_uncertainty)
+    plot_trend_magnitude_duration_heatmap(trace, current_trend)
     plt.show()
 
 
