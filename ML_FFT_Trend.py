@@ -11,12 +11,12 @@ from scipy.stats import gaussian_kde
 # ======== Configuration ========
 SYMBOL = '^TNX'  # 10-Year Treasury Yield
 START_DATE = '2022-01-01'
-END_DATE = '2025-02-22'
+END_DATE = '2025-03-06'
 PRICE_COLUMN = 'Close'
 MIN_DATA_POINTS = 10  # Minimum data points required
-BASE_WINDOW = 8  # Base observation window
-THRESHOLD_RATIO = 0.001  # Trend confirmation sensitivity
-VOLATILITY_FACTOR = 1  # Window adjustment sensitivity
+BASE_WINDOW = 5  # Base observation window
+THRESHOLD_RATIO = 0.01  # Trend confirmation sensitivity
+VOLATILITY_FACTOR = 5  # Window adjustment sensitivity
 
 
 # ======== Neural Network Architecture ========
@@ -205,7 +205,7 @@ def render_dashboard(prices, dates, levels, types):
     x = np.linspace(xmin, xmax, 500)
 
     # Dual visualization
-    ax_duration.hist(durations, bins=50, density=True, color='teal', alpha=0.3)
+    ax_duration.hist(durations, bins=100, density=True, color='teal', alpha=0.3)
     ax_duration.plot(x, kde_duration(x), color='darkblue', lw=2, label='KDE Estimate')
     ax_duration.set_xlabel('Trend Duration (Days)')
     ax_duration.set_title('Duration Probability Density Distribution')
@@ -224,7 +224,7 @@ def render_dashboard(prices, dates, levels, types):
         ax_change.text(0.5, 0.5, 'Insufficient data for distribution', ha='center')
 
     # Combined visualization
-    ax_change.hist(changes, bins=50, density=True, color='salmon', alpha=0.3)
+    ax_change.hist(changes, bins=100, density=True, color='salmon', alpha=0.3)
     ax_change.set_xlabel('Price Change Magnitude')
     ax_change.set_title('Price Change Probability Density Distribution')
     ax_change.legend()
