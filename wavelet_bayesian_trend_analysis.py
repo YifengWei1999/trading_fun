@@ -16,7 +16,7 @@ END_DATE = datetime.now().strftime('%Y-%m-%d')
 PRICE_COLUMN = 'Close'
 WAVELET_TYPE = 'cmor1.5-1.0'  # Complex Morlet wavelet
 MAX_SCALE = 256  # Maximum scale for wavelet transform
-MCMC_SAMPLES = 2000  # MCMC sampling iterations
+MCMC_SAMPLES = None  # Remove MCMC configuration since we're using VI
 
 
 # ======== Data Pipeline ========
@@ -84,7 +84,7 @@ def identify_dominant_cycles(coefficients, periods):
 
 # ======== Bayesian Trend Analysis ========
 def build_bayesian_model(trends):
-    """Build Bayesian model for trend duration and magnitude"""
+    """Build Bayesian model using Variational Inference instead of MCMC"""
     durations = np.array([trend['duration'] for trend in trends])
     magnitudes = np.array([trend['magnitude'] for trend in trends])
     directions = np.array([trend['direction'] for trend in trends])
@@ -117,8 +117,9 @@ def build_bayesian_model(trends):
         magnitude = pm.Normal('magnitude', mu=mag_mu, sigma=mag_sigma,
                               observed=magnitudes)
 
-        # Sample from the posterior
-        trace = pm.sample(MCMC_SAMPLES, tune=10000, return_inferencedata=True)
+        # Use Variational Inference instead of MCMC
+        approx = pm.fit(n=10000, method='advi')  # Faster than MCMC
+        trace = approx.sample(1000)  # Sample from the approximated posterior
 
     return trace
 
@@ -271,8 +272,8 @@ def extract_trends(prices, min_trend_duration=3):
 
 
 def calculate_trend_probabilities(trace, current_trend):
-    """Calculate probability of trend continuation"""
-    # Extract posterior distributions
+    """Calculate probability of trend continuation using VI results"""
+    # Extract posterior distributions (same as before)
     if current_trend['direction'] == 1:
         duration_samples = trace.posterior['up_duration_mu'].values.flatten()
     else:
@@ -286,12 +287,13 @@ def calculate_trend_probabilities(trace, current_trend):
 
     # Calculate probability of trend continuing for different time periods
     continuation_probs = {}
-    for days in [5, 10, 20, 30]:
-        # Probability that trend lasts at least current_duration + days
-        prob = np.mean(stats.gamma.sf(current_duration + days,
-                                      a=duration_samples ** 2 / (duration_samples / 10) ** 2,
-                                      scale=(duration_samples / 10) ** 2 / duration_samples))
-        continuation_probs[days] = prob
+    for days in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30]:
+        # Use mean and std of the VI approximation for faster computation
+        mu = np.mean(duration_samples)
+        sigma = np.std(duration_samples)
+        z_score = (current_duration + days - mu) / (sigma + 1e-6)
+        prob = 1 - stats.norm.cdf(z_score)
+        continuation_probs[days] = max(0.1, min(0.9, prob))  # Bound probabilities
 
     # Calculate expected magnitude change
     expected_magnitude = np.mean(magnitude_mu)
@@ -404,7 +406,64 @@ def plot_trends_on_price(prices, trends):
 
     # Adjust layout
     plt.tight_layout()
-    plt.show()
+
+
+def plot_trend_probabilities(continuation_probs, expected_magnitude, magnitude_uncertainty):
+    """Plot trend continuation probabilities and magnitude expectations"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
+    # Plot 1: Trend Continuation Probability
+    days = list(continuation_probs.keys())
+    probs = list(continuation_probs.values())
+
+    ax1.plot(days, probs, 'b-', linewidth=2, marker='o')
+    ax1.fill_between(days,
+                     [max(0, p - 0.1) for p in probs],
+                     [min(1, p + 0.1) for p in probs],
+                     alpha=0.2, color='blue')
+
+    ax1.set_xlabel('Days Ahead', fontsize=10)
+    ax1.set_ylabel('Continuation Probability', fontsize=10)
+    ax1.set_title('Trend Continuation Probability vs Time', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_ylim(0, 1)
+
+    # Add probability values
+    for i, prob in enumerate(probs):
+        ax1.annotate(f'{prob:.2f}',
+                     (days[i], probs[i]),
+                     xytext=(0, 5),
+                     textcoords='offset points',
+                     ha='center',
+                     fontsize=8)
+
+    # Plot 2: Expected Magnitude Distribution
+    x = np.linspace(expected_magnitude - 3 * magnitude_uncertainty,
+                    expected_magnitude + 3 * magnitude_uncertainty,
+                    100)
+    y = stats.norm.pdf(x, expected_magnitude, magnitude_uncertainty)
+
+    ax2.plot(x, y, 'r-', linewidth=2)
+    ax2.fill_between(x, y, alpha=0.2, color='red')
+
+    ax2.axvline(expected_magnitude, color='r', linestyle='--', alpha=0.5)
+    ax2.axvline(expected_magnitude - magnitude_uncertainty, color='r', linestyle=':', alpha=0.5)
+    ax2.axvline(expected_magnitude + magnitude_uncertainty, color='r', linestyle=':', alpha=0.5)
+
+    ax2.set_xlabel('Magnitude', fontsize=10)
+    ax2.set_ylabel('Probability Density', fontsize=10)
+    ax2.set_title('Expected Magnitude Distribution', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+
+    # Add magnitude annotations
+    ax2.annotate(f'Mean: {expected_magnitude:.4f}',
+                 xy=(expected_magnitude, ax2.get_ylim()[1]),
+                 xytext=(0, 5),
+                 textcoords='offset points',
+                 ha='center',
+                 fontsize=9)
+
+    plt.tight_layout()
 
 
 # ======== Main Execution ========
@@ -473,7 +532,7 @@ def main():
     print("\n🎨 Generating visualizations...")
     plot_trends_on_price(prices, trends)
     plot_wavelet_analysis(coefficients, periods, prices)
-    plot_bayesian_results(trace, trends, current_trend, continuation_probs)
+    plot_trend_probabilities(continuation_probs, expected_magnitude, magnitude_uncertainty)
     plt.show()
 
 
