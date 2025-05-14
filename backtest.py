@@ -54,6 +54,58 @@ class MovingAverageCrossover(Strategy):
         return df
 
 
+class VolumeSpikeMomentum(Strategy):
+    """Strategy that follows price direction after volume spikes"""
+
+    def __init__(self, volume_threshold: float = 2.0, lookback_period: int = 20):
+        """
+        Initialize the volume spike momentum strategy
+
+        Parameters:
+        -----------
+        volume_threshold : float
+            Multiple of average volume that constitutes a spike (e.g., 2.0 = 2x avg volume)
+        lookback_period : int
+            Period used to calculate the average volume
+        """
+        self.volume_threshold = volume_threshold
+        self.lookback_period = lookback_period
+
+    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
+        df = data.copy()
+
+        # Calculate rolling average volume
+        df['avg_volume'] = df['Volume'].rolling(window=self.lookback_period).mean()
+
+        # Identify volume spikes
+        df['volume_spike'] = (df['Volume'] > (df['avg_volume'] * self.volume_threshold)).astype(int)
+
+        # Price direction (1 for up, -1 for down, 0 for no change)
+        df['price_direction'] = np.sign(df['Close'].diff())
+
+        # Signal follows the direction 1 period after a volume spike
+        df['signal'] = 0
+
+        # Shift the volume spike to align with the next period
+        spike_indices = df[df['volume_spike'] == 1].index
+
+        # For each spike, get the direction of the next period and set as signal
+        for idx in spike_indices:
+            try:
+                next_idx = df.index[df.index.get_loc(idx) + 1]
+                if next_idx in df.index:
+                    df.loc[next_idx, 'signal'] = df.loc[next_idx, 'price_direction']
+            except (IndexError, KeyError):
+                # Handle the case where the spike is at the last data point
+                continue
+
+        # Generate positions from signals
+        df['position'] = df['signal'].shift(1)
+        df['position'].fillna(0, inplace=True)
+
+        return df
+
+
 class Asset:
     """Class representing a tradable asset"""
 
@@ -90,6 +142,28 @@ class Asset:
         print(f"Data retrieved: {len(df)} trading days")
         self.data = df
         return df
+
+    def set_custom_data(self, data: pd.DataFrame) -> None:
+        """
+        Set custom market data for the asset
+
+        Parameters:
+        -----------
+        data : pd.DataFrame
+            DataFrame with OHLCV data, should have columns: Open, High, Low, Close, Volume
+            and a DatetimeIndex
+        """
+        required_columns = ['Open', 'High', 'Low', 'Close', 'Volume']
+        missing_columns = [col for col in required_columns if col not in data.columns]
+
+        if missing_columns:
+            raise ValueError(f"Data is missing required columns: {missing_columns}")
+
+        if not isinstance(data.index, pd.DatetimeIndex):
+            raise ValueError("Data index must be a DatetimeIndex")
+
+        self.data = data
+        print(f"Custom data set for {self.symbol}: {len(data)} intervals")
 
 
 class Portfolio:
@@ -234,7 +308,7 @@ class BacktestEngine:
 
     def plot_results(self, symbol: Optional[str] = None):
         """
-        Plot backtest results
+        Plot comprehensive backtest results including positions
 
         Parameters:
         -----------
@@ -251,40 +325,177 @@ class BacktestEngine:
         for sym in symbols:
             df = self.results[sym]
 
-            plt.figure(figsize=(12, 10))
+            # Create a comprehensive figure with 4 subplots
+            fig, axs = plt.subplots(4, 1, figsize=(14, 16), sharex=True, gridspec_kw={'height_ratios': [3, 1, 2, 1]})
 
-            # Plot 1: Price and Moving Averages
-            plt.subplot(3, 1, 1)
-            plt.plot(df.index, df['Close'], label=sym)
+            # Plot 1: Price with Moving Averages and position highlighting
+            ax1 = axs[0]
+            ax1.plot(df.index, df['Close'], label=sym, color='blue')
+
+            # Add moving averages if available
             if 'fast_ma' in df.columns and 'slow_ma' in df.columns:
-                plt.plot(df.index, df['fast_ma'], label=f'{self.strategy.fast_period}-day MA')
-                plt.plot(df.index, df['slow_ma'], label=f'{self.strategy.slow_period}-day MA')
-            plt.title(f'{sym} Price Chart')
-            plt.legend()
+                ax1.plot(df.index, df['fast_ma'], label=f'Fast MA', color='orange', alpha=0.8)
+                ax1.plot(df.index, df['slow_ma'], label=f'Slow MA', color='purple', alpha=0.8)
 
-            # Plot 2: Strategy Performance
-            plt.subplot(3, 1, 2)
-            plt.plot(df.index, df['cumulative_returns'], label='Buy & Hold')
-            plt.plot(df.index, df['strategy_cumulative_returns'], label='Strategy')
-            plt.title('Strategy Performance')
-            plt.legend()
+                # If we're using a MovingAverageCrossover strategy, add labels with periods
+                if isinstance(self.strategy, MovingAverageCrossover):
+                    ax1.plot([], [], label=f'Fast MA ({self.strategy.fast_period} periods)', color='orange')
+                    ax1.plot([], [], label=f'Slow MA ({self.strategy.slow_period} periods)', color='purple')
 
-            # Plot 3: Drawdowns
-            plt.subplot(3, 1, 3)
-            plt.fill_between(df.index, df['drawdown'], 0, color='red', alpha=0.3)
-            plt.title('Drawdowns')
+            # Highlight background based on position
+            for i in range(1, len(df)):
+                pos_value = df['position'].iloc[i]
+                if hasattr(pos_value, 'iloc'):  # If it's a Series, get the first value
+                    pos_value = pos_value.iloc[0]
+
+                if pos_value > 0:  # Long position
+                    ax1.axvspan(df.index[i - 1], df.index[i], alpha=0.1, color='green')
+                elif pos_value < 0:  # Short position
+                    ax1.axvspan(df.index[i - 1], df.index[i], alpha=0.1, color='red')
+
+            ax1.set_title(f'{sym} Price and Strategy Performance', fontsize=14)
+            ax1.set_ylabel('Price', fontsize=12)
+            ax1.legend(loc='upper left')
+            ax1.grid(alpha=0.3)
+
+            # Plot 2: Positions
+            ax2 = axs[1]
+            ax2.fill_between(df.index, df['position'], 0, where=df['position'] > 0, color='green', alpha=0.5,
+                             label='Long')
+            ax2.fill_between(df.index, df['position'], 0, where=df['position'] < 0, color='red', alpha=0.5,
+                             label='Short')
+            ax2.plot(df.index, df['position'], color='black', linewidth=0.8)
+
+            # Add markers for position changes
+            entries = df.index[(df['position'].shift(1) == 0) & (df['position'] != 0)]
+            exits = df.index[(df['position'].shift(1) != 0) & (df['position'] == 0)]
+
+            for entry in entries:
+                pos = df.loc[entry, 'position']
+                if hasattr(pos, 'iloc'):  # If it's a Series, get the first value
+                    pos = pos.iloc[0]
+
+                if pos != 0:  # Only mark non-zero positions
+                    color = 'green' if pos > 0 else 'red'
+                    marker = '^' if pos > 0 else 'v'
+                    ax2.scatter(entry, pos, color=color, s=80, marker=marker, zorder=5)
+
+            for exit in exits:
+                ax2.scatter(exit, 0, color='black', s=80, marker='o', zorder=5)
+
+            ax2.set_ylabel('Position', fontsize=12)
+            ax2.legend(loc='upper right')
+            ax2.grid(alpha=0.3)
+
+            # Plot 3: Strategy Performance
+            ax3 = axs[2]
+            ax3.plot(df.index, df['cumulative_returns'], label='Buy & Hold', color='gray')
+            ax3.plot(df.index, df['strategy_cumulative_returns'], label='Strategy', color='blue')
+            ax3.set_ylabel('Cumulative Returns', fontsize=12)
+            ax3.legend(loc='upper left')
+            ax3.grid(alpha=0.3)
+
+            # Plot 4: Drawdowns
+            ax4 = axs[3]
+            ax4.fill_between(df.index, df['drawdown'], 0, color='red', alpha=0.5)
+            ax4.set_ylabel('Drawdown', fontsize=12)
+            ax4.set_xlabel('Date', fontsize=12)
+            ax4.grid(alpha=0.3)
+
+            # If we have date index, add vertical lines for month boundaries
+            if isinstance(df.index, pd.DatetimeIndex) and len(df) > 30:
+                # The safer way to identify month changes
+                dates = pd.Series(df.index)
+                months = dates.dt.month
+                month_changes = []
+
+                # Find the first day of each month
+                for i in range(1, len(months)):
+                    if months.iloc[i] != months.iloc[i - 1]:
+                        month_changes.append(df.index[i])
+
+                for month_change in month_changes:
+                    for ax in axs:
+                        ax.axvline(x=month_change, color='gray', linestyle='-', alpha=0.3)
+
             plt.tight_layout()
-
             plt.show()
+
+            # Create a second plot with daily summary
+            if isinstance(df.index, pd.DatetimeIndex) and len(df) > 5:
+                # Check if we have intraday data
+                has_intraday = False
+                try:
+                    has_intraday = df.index.hour.any() or df.index.minute.any()
+                except AttributeError:
+                    # Some datetime indices might not have hour/minute
+                    pass
+
+                if has_intraday:
+                    try:
+                        # Daily position and price
+                        daily_positions = df['position'].resample('D').last()
+                        daily_close = df['Close'].resample('D').last()
+
+                        # Calculate daily returns
+                        daily_returns = df['strategy_returns'].resample('D').sum()
+
+                        # Create the daily summary plots
+                        fig, axs = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+
+                        # Plot 1: Daily price
+                        ax1 = axs[0]
+                        ax1.plot(daily_close.index, daily_close, label=f'{sym} Price', color='blue')
+                        ax1.set_title(f'{sym} Daily Summary', fontsize=14)
+                        ax1.set_ylabel('Price', fontsize=12)
+                        ax1.legend()
+                        ax1.grid(alpha=0.3)
+
+                        # Plot 2: Daily positions
+                        ax2 = axs[1]
+
+                        # Handle the case where positions might be Series objects
+                        colors = []
+                        for p in daily_positions:
+                            if hasattr(p, 'iloc'):  # If it's a Series, get the first value
+                                p = p.iloc[0]
+                            colors.append('green' if p > 0 else 'red' if p < 0 else 'gray')
+
+                        ax2.bar(daily_positions.index, daily_positions, color=colors, alpha=0.7)
+                        ax2.set_ylabel('End-of-Day Position', fontsize=12)
+                        ax2.grid(alpha=0.3)
+
+                        # Plot 3: Daily returns
+                        ax3 = axs[2]
+
+                        # Handle the case where returns might be Series objects
+                        colors = []
+                        daily_return_values = []
+
+                        for r in daily_returns:
+                            if hasattr(r, 'iloc'):  # If it's a Series, get the first value
+                                r = r.iloc[0]
+                            colors.append('green' if r > 0 else 'red')
+                            daily_return_values.append(r * 100)  # Convert to percentage
+
+                        ax3.bar(daily_returns.index, daily_return_values, color=colors, alpha=0.7)
+                        ax3.set_ylabel('Daily Return (%)', fontsize=12)
+                        ax3.set_xlabel('Date', fontsize=12)
+                        ax3.grid(alpha=0.3)
+
+                        plt.tight_layout()
+                        plt.show()
+                    except Exception as e:
+                        print(f"Warning: Could not generate daily summary plot: {e}")
 
 
 # Example usage with TY futures using 10d and 20d moving average crossing
 if __name__ == "__main__":
     # Create asset - using ^TNX as a proxy for 10-year Treasury futures
     # ZN is the 10-year Treasury futures symbol, but we'll use ^TNX for data availability
-    stock = Asset(
-        symbol='AAPL',
-        asset_type='Stock',
+    ty_futures = Asset(
+        symbol='^TNX',  # 10-year Treasury Yield
+        asset_type='futures',
         multiplier=1000,  # Each contract represents $1000 times the face value
         margin_requirement=0.05  # 5% margin requirement
     )
@@ -294,9 +505,9 @@ if __name__ == "__main__":
 
     # Create and run backtest
     backtest = BacktestEngine(
-        assets=[stock],
+        assets=[ty_futures],
         strategy=ma_strategy,
-        start_date='2020-01-01',
+        start_date='2025-01-01',
         end_date='2025-05-14',
         initial_capital=100000
     )
